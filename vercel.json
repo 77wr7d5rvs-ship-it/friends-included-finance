@@ -6,6 +6,8 @@
   ],
   "routes": [
     { "src": "/api/(.*)", "dest": "/api/finance.js" },
+    { "src": "/app.js", "dest": "/app.js" },
+    { "src": "/styles.css", "dest": "/styles.css" },
     { "src": "/(.*)", "dest": "/index.html" }
   ]
 }
