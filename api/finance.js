@@ -46,9 +46,12 @@ function validate(input, actor) {
 }
 function commission(amount, split) {
   const pool = Math.round(money(amount) * 10); // cents, 10% pool
-  const result = []; let used = 0;
-  split.forEach((share, index) => { const cents = index === 2 ? pool - used : Math.floor(pool * Number(share) / 100); used += cents; result.push(cents / 100); });
-  return result; // remainder priority: Richard, then Anastasia, then Jean-Claude through truncation order
+  const cents = split.map(share => Math.floor(pool * Number(share) / 100));
+  const remainder = pool - cents.reduce((a, b) => a + b, 0);
+  const largest = Math.max(...split.map(Number));
+  const priorityWinner = split.map(Number).findIndex(share => share === largest);
+  cents[priorityWinner] += remainder;
+  return cents.map(value => value / 100);
 }
 async function logAttempt(transactionId, channel, status, detail = '') {
   try { await db('delivery_attempts', { method: 'POST', body: JSON.stringify({ transaction_id: transactionId, channel, status, detail }) }); } catch { /* audit failure never blocks accounting */ }
