@@ -74,7 +74,7 @@ async function syncSheet(t) {
     else await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEETS_ID, range: `${tab}!A:${t.kind === 'sale' ? 'K' : 'I'}`, valueInputOption: 'USER_ENTERED', requestBody: { values: [row] } });
     await db(`transactions?id=eq.${t.id}`, { method: 'PATCH', body: JSON.stringify({ sheet_status: 'synced' }) });
     await logAttempt(t.id, 'sheets', 'synced');
-  } catch (error) { await db(`transactions?id=eq.${t.id}`, { method: 'PATCH', body: JSON.stringify({ sheet_status: 'retry' }) }); await logAttempt(t.id, 'sheets', 'retry', error.message); }
+  } catch (error) { console.error('Sheets sync failed:', error.message); await db(`transactions?id=eq.${t.id}`, { method: 'PATCH', body: JSON.stringify({ sheet_status: 'retry' }) }); await logAttempt(t.id, 'sheets', 'retry', error.message); }
 }
 async function hydratedTransactions() {
   const rows = await db('transactions?select=*,employees(name,role,telegram_chat_id)&order=submitted_at.asc');
@@ -110,7 +110,7 @@ async function decide(id, input) {
 async function telegramWebhook(update) {
   const message = update.message; if (!message?.text) return;
   const id = message.from.id, chatId = message.chat.id; const staff = (await db(`employees?telegram_user_id=eq.${id}&select=name,role&limit=1`))[0];
-  if (!staff) { await telegram(chatId, 'Your Telegram account is not linked. Ask Svetlana to link it in the manager area.', '00000000-0000-0000-0000-000000000000'); return; }
+  if (!staff) { await telegram(chatId, `Your Telegram account is not linked. Ask Svetlana to link user ID ${id} and chat ID ${chatId} in the manager area.`, '00000000-0000-0000-0000-000000000000'); return; }
   const text = message.text.trim();
   if (text === '/start' || text === '/help') { await telegram(chatId, 'Friends Included Finance\nSales: /sale REF | Customer | Description | A/B | Amount | Richard/Anastasia/Jean-Claude split\nExpense: /expense REF | Description | Materials/Travel/Other | Amount | A/B/Overhead', '00000000-0000-0000-0000-000000000000'); return; }
   const [command, ...parts] = text.split('|').map(x => x.trim());
@@ -127,6 +127,8 @@ export default async function handler(req, res) {
     if (req.method === 'OPTIONS') return json(res, 204, {});
     if (path === '/api/health') return json(res, 200, { ok: true, integrations: { supabase: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY), telegram: Boolean(process.env.TELEGRAM_BOT_TOKEN), sheets: Boolean(process.env.GOOGLE_SHEETS_ID && process.env.GOOGLE_SERVICE_ACCOUNT_JSON) } });
     if (path === '/api/state' && req.method === 'GET') { const records = await hydratedTransactions(); return json(res, 200, { records, totals: totals(records) }); }
+    if (path === '/api/telegram/link' && req.method === 'POST') { const body = await readBody(req); if (body.actor !== 'Svetlana de Monte Carlo' || !roles[body.employee]) throw new Error('Only Svetlana can link Telegram users.'); await db(`employees?name=eq.${encodeURIComponent(body.employee)}`, { method: 'PATCH', body: JSON.stringify({ telegram_user_id: String(body.telegram_user_id), telegram_chat_id: String(body.telegram_chat_id) }) }); return json(res, 200, { ok: true }); }
+    if (path === '/api/admin/reset-bot-tests' && req.method === 'POST') { const body = await readBody(req); if (body.actor !== 'Svetlana de Monte Carlo') throw new Error('Only Svetlana can reset test bot records.'); await db('transactions?reference=in.(S01,E01)', { method: 'DELETE' }); return json(res, 200, { ok: true }); }
     if (path === '/api/sync' && req.method === 'POST') { const records = await hydratedTransactions(); await Promise.all(records.map(syncSheet)); return json(res, 200, { ok: true, count: records.length }); }
     if (path === '/api/transactions' && req.method === 'POST') { const body = await readBody(req); const transaction = await createTransaction(body, body.actor); return json(res, 201, { transaction }); }
     const decision = path.match(/^\/api\/transactions\/([^/]+)\/decide$/);
