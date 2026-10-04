@@ -131,8 +131,17 @@ export default async function handler(req, res) {
     const path = (req.url || '').split('?')[0];
     if (req.method === 'OPTIONS') return json(res, 204, {});
     if (path === '/api/health') return json(res, 200, { ok: true, integrations: { supabase: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY), telegram: Boolean(process.env.TELEGRAM_BOT_TOKEN), sheets: Boolean(process.env.GOOGLE_SHEETS_ID && process.env.GOOGLE_SERVICE_ACCOUNT_JSON) } });
-    if (path === '/api/state' && req.method === 'GET') { const records = await hydratedTransactions(); return json(res, 200, { records, totals: totals(records) }); }
+    if (path === '/api/state' && req.method === 'GET') {
+      const actor = new URL(req.url || '/api/state', 'http://localhost').searchParams.get('actor');
+      if (!roles[actor]) throw new Error('Choose a recognised employee.');
+      const allRecords = await hydratedTransactions();
+      const records = roles[actor] === 'manager' ? allRecords : allRecords.filter(t => t.submitter_name === actor);
+      const visibleTotals = totals(records);
+      if (roles[actor] !== 'manager') visibleTotals.earned = visibleTotals.earned.filter(item => item.name === actor);
+      return json(res, 200, { records, totals: visibleTotals, scope: roles[actor] === 'manager' ? 'all' : 'own' });
+    }
     if (path === '/api/telegram/link' && req.method === 'POST') { const body = await readBody(req); if (body.actor !== 'Svetlana de Monte Carlo' || !roles[body.employee]) throw new Error('Only Svetlana can link Telegram users.'); await db(`employees?telegram_user_id=eq.${encodeURIComponent(body.telegram_user_id)}`, { method: 'PATCH', body: JSON.stringify({ telegram_user_id: null, telegram_chat_id: null }) }); await db(`employees?name=eq.${encodeURIComponent(body.employee)}`, { method: 'PATCH', body: JSON.stringify({ telegram_user_id: String(body.telegram_user_id), telegram_chat_id: String(body.telegram_chat_id) }) }); return json(res, 200, { ok: true }); }
+    if (path === '/api/telegram/unlink' && req.method === 'POST') { const body = await readBody(req); if (body.actor !== 'Svetlana de Monte Carlo' || !roles[body.employee]) throw new Error('Only Svetlana can unlink Telegram users.'); await db(`employees?name=eq.${encodeURIComponent(body.employee)}`, { method: 'PATCH', body: JSON.stringify({ telegram_user_id: null, telegram_chat_id: null }) }); return json(res, 200, { ok: true }); }
     if (path === '/api/admin/reset-bot-tests' && req.method === 'POST') { const body = await readBody(req); if (body.actor !== 'Svetlana de Monte Carlo') throw new Error('Only Svetlana can reset test bot records.'); await db('transactions?reference=in.(S01,E01)', { method: 'DELETE' }); return json(res, 200, { ok: true }); }
     if (path === '/api/sync' && req.method === 'POST') { const records = await hydratedTransactions(); await Promise.all(records.map(syncSheet)); return json(res, 200, { ok: true, count: records.length }); }
     if (path === '/api/transactions' && req.method === 'POST') { const body = await readBody(req); const transaction = await createTransaction(body, body.actor); return json(res, 201, { transaction }); }
