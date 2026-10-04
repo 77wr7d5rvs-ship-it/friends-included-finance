@@ -57,8 +57,9 @@ async function logAttempt(transactionId, channel, status, detail = '') {
   try { await db('delivery_attempts', { method: 'POST', body: JSON.stringify({ transaction_id: transactionId, channel, status, detail }) }); } catch { /* audit failure never blocks accounting */ }
 }
 async function telegram(chatId, text, transactionId) {
-  if (!chatId || !process.env.TELEGRAM_BOT_TOKEN) return logAttempt(transactionId, 'telegram', 'pending', 'No linked chat or bot token.');
+  if (!chatId || !process.env.TELEGRAM_BOT_TOKEN) { if (transactionId && !String(transactionId).startsWith('00000000')) await db(`transactions?id=eq.${transactionId}`, { method: 'PATCH', body: JSON.stringify({ notification_status: 'pending' }) }); return logAttempt(transactionId, 'telegram', 'pending', 'No linked chat or bot token.'); }
   const r = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text }) });
+  if (transactionId && !String(transactionId).startsWith('00000000')) await db(`transactions?id=eq.${transactionId}`, { method: 'PATCH', body: JSON.stringify({ notification_status: r.ok ? 'sent' : 'retry' }) });
   await logAttempt(transactionId, 'telegram', r.ok ? 'sent' : 'retry', r.ok ? '' : await r.text());
 }
 async function syncSheet(t) {
@@ -67,14 +68,15 @@ async function syncSheet(t) {
     const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
     const client = new google.auth.JWT({ email: credentials.client_email, key: credentials.private_key, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
     const sheets = google.sheets({ version: 'v4', auth: client });
+    const earned = t.final_split ? commission(t.amount, t.final_split) : ['', '', ''];
     const row = t.kind === 'sale'
-      ? [t.reference, t.submitted_at, t.submitter_name, t.customer, t.project, t.description, t.amount, (t.proposed_split || []).join(' / '), (t.final_split || []).join(' / '), (t.final_split ? commission(t.amount, t.final_split) : []).join(' / '), t.status]
+      ? [t.reference, t.submitted_at, t.submitter_name, t.customer, t.project, t.description, t.amount, ...(t.proposed_split || ['', '', '']), ...(t.final_split || ['', '', '']), ...earned, t.status]
       : [t.reference, t.submitted_at, t.submitter_name, t.description, t.category, t.amount, t.proposed_allocation, t.final_allocation || '', t.status];
     const tab = t.kind === 'sale' ? 'Sales' : 'Expenses';
     const existing = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEETS_ID, range: `${tab}!A:A` });
     const rowIndex = (existing.data.values || []).findIndex(value => value?.[0] === t.reference);
     if (rowIndex >= 0) await sheets.spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SHEETS_ID, range: `${tab}!A${rowIndex + 1}`, valueInputOption: 'USER_ENTERED', requestBody: { values: [row] } });
-    else await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEETS_ID, range: `${tab}!A:${t.kind === 'sale' ? 'K' : 'I'}`, valueInputOption: 'USER_ENTERED', requestBody: { values: [row] } });
+    else await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEETS_ID, range: `${tab}!A:${t.kind === 'sale' ? 'Q' : 'I'}`, valueInputOption: 'USER_ENTERED', requestBody: { values: [row] } });
     await db(`transactions?id=eq.${t.id}`, { method: 'PATCH', body: JSON.stringify({ sheet_status: 'synced' }) });
     await logAttempt(t.id, 'sheets', 'synced');
   } catch (error) { console.error('Sheets sync failed:', error.message); await db(`transactions?id=eq.${t.id}`, { method: 'PATCH', body: JSON.stringify({ sheet_status: 'retry' }) }); await logAttempt(t.id, 'sheets', 'retry', error.message); }
@@ -98,7 +100,7 @@ async function createTransaction(input, actor, source = 'website', chatId = null
   validate(input, actor); const person = await employee(actor); const reference = input.reference.trim().toUpperCase();
   const sale = input.kind === 'sale', overhead = input.proposed_allocation === 'Overhead';
   const row = { reference, kind: input.kind, submitter_id: person.id, customer: sale ? input.customer.trim() : null, project: sale ? input.project : null, description: input.description.trim(), amount: money(input.amount), category: sale ? null : input.category, proposed_allocation: sale ? null : input.proposed_allocation, final_allocation: overhead ? 'Overhead' : null, proposed_split: sale ? input.proposed_split.map(Number) : null, status: sale ? 'pending' : overhead ? 'allocated' : 'awaiting_allocation', source, origin_chat_id: chatId };
-  try { const [created] = await db('transactions', { method: 'POST', body: JSON.stringify(row) }); const t = { ...created, submitter_name: actor, submitter_chat_id: chatId }; syncSheet(t); telegram(chatId, `${reference} recorded. Status: ${t.status}.`, t.id); return t; } catch (error) { if (error.message.includes('duplicate key')) throw new Error('Duplicate reference rejected.'); throw error; }
+  try { const [created] = await db('transactions', { method: 'POST', body: JSON.stringify(row) }); const t = { ...created, submitter_name: actor, submitter_chat_id: chatId }; syncSheet(t); telegram(chatId, sale ? `${reference} recorded. €${money(t.amount).toFixed(2)}, Project ${t.project}, proposed split ${t.proposed_split.join('/')}%. Status: pending.` : `${reference} recorded. €${money(t.amount).toFixed(2)}, proposed allocation ${t.proposed_allocation}. Status: ${t.status}.`, t.id); return t; } catch (error) { if (error.message.includes('duplicate key')) throw new Error('Duplicate reference rejected.'); throw error; }
 }
 async function decide(id, input) {
   if (input.actor !== 'Svetlana de Monte Carlo') throw new Error('Only Svetlana can approve or correct a record.');
@@ -108,7 +110,7 @@ async function decide(id, input) {
   if (t.kind === 'sale') { const split = (input.split || t.proposed_split).map(Number); if (split.length !== 3 || split.some(n => !Number.isInteger(n) || n < 0) || split.reduce((a, n) => a + n, 0) !== 100) throw new Error('Final commission shares must total 100%.'); patch.final_split = split; patch.status = 'approved'; }
   else { const allocation = input.allocation || t.proposed_allocation; if (!['A', 'B', 'Overhead'].includes(allocation)) throw new Error('Choose project A, B, or overhead.'); patch.final_allocation = allocation; patch.status = 'allocated'; }
   const [updated] = await db(`transactions?id=eq.${id}`, { method: 'PATCH', body: JSON.stringify(patch) }); const full = { ...updated, submitter_name: t.submitter_name, submitter_chat_id: t.submitter_chat_id };
-  syncSheet(full); telegram(t.origin_chat_id || t.submitter_chat_id, `${t.reference} was ${full.status}${full.kind === 'sale' ? ` with split ${full.final_split.join('/')}` : ` to ${full.final_allocation}`}.`, full.id); return full;
+  syncSheet(full); const changed = full.kind === 'sale' ? JSON.stringify(t.proposed_split) !== JSON.stringify(full.final_split) : t.proposed_allocation !== full.final_allocation; const note = full.kind === 'sale' ? `Sale ${t.reference} approved${changed ? ' — commission split changed' : ''}. Sale €${money(t.amount).toFixed(2)}; total commission €${money(t.amount * .1).toFixed(2)}. ${salesPeople.map((name,i)=>`${name}: ${t.proposed_split[i]}% → ${full.final_split[i]}% (€${commission(t.amount, full.final_split)[i].toFixed(2)})`).join('. ')}.` : `Expense ${t.reference} — allocation ${changed ? 'changed' : 'confirmed'}. €${money(t.amount).toFixed(2)}: ${t.description}. Proposed: ${t.proposed_allocation}. Approved: ${full.final_allocation}.`; telegram(t.origin_chat_id || t.submitter_chat_id, note, full.id); return full;
 }
 async function telegramWebhook(update) {
   const message = update.message; if (!message?.text) return;
@@ -136,6 +138,8 @@ export default async function handler(req, res) {
     if (path === '/api/transactions' && req.method === 'POST') { const body = await readBody(req); const transaction = await createTransaction(body, body.actor); return json(res, 201, { transaction }); }
     const decision = path.match(/^\/api\/transactions\/([^/]+)\/decide$/);
     if (decision && req.method === 'POST') { const transaction = await decide(decision[1], await readBody(req)); return json(res, 200, { transaction }); }
+    const retry = path.match(/^\/api\/transactions\/([^/]+)\/retry$/);
+    if (retry && req.method === 'POST') { const body = await readBody(req); if (body.actor !== 'Svetlana de Monte Carlo') throw new Error('Only Svetlana can retry integrations.'); const transaction = (await hydratedTransactions()).find(x => x.id === retry[1]); if (!transaction) throw new Error('Record not found.'); if (body.channel === 'sheets') await syncSheet(transaction); else if (body.channel === 'telegram') await telegram(transaction.origin_chat_id || transaction.submitter_chat_id, `${transaction.reference} status: ${transaction.status}.`, transaction.id); else throw new Error('Choose sheets or telegram retry.'); return json(res, 200, { ok: true }); }
     if (path === '/api/telegram/webhook' && req.method === 'POST') { await telegramWebhook(await readBody(req)); return json(res, 200, { ok: true }); }
     return json(res, 404, { error: 'Not found.' });
   } catch (error) { return json(res, 400, { error: error.message || 'Request failed.' }); }
