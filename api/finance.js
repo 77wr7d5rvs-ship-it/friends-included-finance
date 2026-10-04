@@ -67,7 +67,11 @@ async function syncSheet(t) {
     const row = t.kind === 'sale'
       ? [t.reference, t.submitted_at, t.submitter_name, t.customer, t.project, t.description, t.amount, (t.proposed_split || []).join(' / '), (t.final_split || []).join(' / '), (t.final_split ? commission(t.amount, t.final_split) : []).join(' / '), t.status]
       : [t.reference, t.submitted_at, t.submitter_name, t.description, t.category, t.amount, t.proposed_allocation, t.final_allocation || '', t.status];
-    await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEETS_ID, range: t.kind === 'sale' ? 'Sales!A:K' : 'Expenses!A:I', valueInputOption: 'USER_ENTERED', requestBody: { values: [row] } });
+    const tab = t.kind === 'sale' ? 'Sales' : 'Expenses';
+    const existing = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEETS_ID, range: `${tab}!A:A` });
+    const rowIndex = (existing.data.values || []).findIndex(value => value?.[0] === t.reference);
+    if (rowIndex >= 0) await sheets.spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SHEETS_ID, range: `${tab}!A${rowIndex + 1}`, valueInputOption: 'USER_ENTERED', requestBody: { values: [row] } });
+    else await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEETS_ID, range: `${tab}!A:${t.kind === 'sale' ? 'K' : 'I'}`, valueInputOption: 'USER_ENTERED', requestBody: { values: [row] } });
     await db(`transactions?id=eq.${t.id}`, { method: 'PATCH', body: JSON.stringify({ sheet_status: 'synced' }) });
     await logAttempt(t.id, 'sheets', 'synced');
   } catch (error) { await db(`transactions?id=eq.${t.id}`, { method: 'PATCH', body: JSON.stringify({ sheet_status: 'retry' }) }); await logAttempt(t.id, 'sheets', 'retry', error.message); }
@@ -123,6 +127,7 @@ export default async function handler(req, res) {
     if (req.method === 'OPTIONS') return json(res, 204, {});
     if (path === '/api/health') return json(res, 200, { ok: true, integrations: { supabase: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY), telegram: Boolean(process.env.TELEGRAM_BOT_TOKEN), sheets: Boolean(process.env.GOOGLE_SHEETS_ID && process.env.GOOGLE_SERVICE_ACCOUNT_JSON) } });
     if (path === '/api/state' && req.method === 'GET') { const records = await hydratedTransactions(); return json(res, 200, { records, totals: totals(records) }); }
+    if (path === '/api/sync' && req.method === 'POST') { const records = await hydratedTransactions(); await Promise.all(records.map(syncSheet)); return json(res, 200, { ok: true, count: records.length }); }
     if (path === '/api/transactions' && req.method === 'POST') { const body = await readBody(req); const transaction = await createTransaction(body, body.actor); return json(res, 201, { transaction }); }
     const decision = path.match(/^\/api\/transactions\/([^/]+)\/decide$/);
     if (decision && req.method === 'POST') { const transaction = await decide(decision[1], await readBody(req)); return json(res, 200, { transaction }); }
