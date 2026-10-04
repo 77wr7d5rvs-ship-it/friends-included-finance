@@ -62,7 +62,7 @@ async function syncSheet(t) {
   if (!process.env.GOOGLE_SHEETS_ID || !process.env.GOOGLE_SERVICE_ACCOUNT_JSON) return logAttempt(t.id, 'sheets', 'pending', 'Sheets credentials are not configured.');
   try {
     const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-    const client = new google.auth.JWT(credentials.client_email, null, credentials.private_key, ['https://www.googleapis.com/auth/spreadsheets']);
+    const client = new google.auth.JWT({ email: credentials.client_email, key: credentials.private_key, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
     const sheets = google.sheets({ version: 'v4', auth: client });
     const row = t.kind === 'sale'
       ? [t.reference, t.submitted_at, t.submitter_name, t.customer, t.project, t.description, t.amount, (t.proposed_split || []).join(' / '), (t.final_split || []).join(' / '), (t.final_split ? commission(t.amount, t.final_split) : []).join(' / '), t.status]
@@ -105,7 +105,7 @@ async function decide(id, input) {
   if (t.kind === 'sale') { const split = (input.split || t.proposed_split).map(Number); if (split.length !== 3 || split.some(n => !Number.isInteger(n) || n < 0) || split.reduce((a, n) => a + n, 0) !== 100) throw new Error('Final commission shares must total 100%.'); patch.final_split = split; patch.status = 'approved'; }
   else { const allocation = input.allocation || t.proposed_allocation; if (!['A', 'B', 'Overhead'].includes(allocation)) throw new Error('Choose project A, B, or overhead.'); patch.final_allocation = allocation; patch.status = 'allocated'; }
   const [updated] = await db(`transactions?id=eq.${id}`, { method: 'PATCH', body: JSON.stringify(patch) }); const full = { ...updated, submitter_name: t.submitter_name, submitter_chat_id: t.submitter_chat_id };
-  syncSheet(full); telegram(t.submitter_chat_id, `${t.reference} was ${full.status}${full.kind === 'sale' ? ` with split ${full.final_split.join('/')}` : ` to ${full.final_allocation}`}.`, full.id); return full;
+  syncSheet(full); telegram(t.origin_chat_id || t.submitter_chat_id, `${t.reference} was ${full.status}${full.kind === 'sale' ? ` with split ${full.final_split.join('/')}` : ` to ${full.final_allocation}`}.`, full.id); return full;
 }
 async function telegramWebhook(update) {
   const message = update.message; if (!message?.text) return;
